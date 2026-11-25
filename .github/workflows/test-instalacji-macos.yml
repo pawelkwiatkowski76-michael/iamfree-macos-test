@@ -1,0 +1,96 @@
+name: Test instalacji IamFree 1.2.0
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  instalacja:
+    name: Instalacja i uruchomienie (${{ matrix.cpu }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            cpu: arm64
+            runtime: arm64
+          - runner: macos-15-intel
+            cpu: x86_64
+            runtime: x64
+    steps:
+      - name: Pobranie publicznego wydania i sprawdzenie pakietu
+        shell: bash
+        env:
+          EXPECTED_CPU: ${{ matrix.cpu }}
+          RUNTIME: ${{ matrix.runtime }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          sw_vers
+          test "$(uname -m)" = "$EXPECTED_CPU"
+          curl --fail --silent --show-error --proto '=https' --retry 2 --max-time 120 \
+            -o klient.zip https://iamfree.pl/monitoring/pobierz/IamFree-Klient-macOS.zip
+          echo 'c2f18122917d8c26b89b3320e2a4560daa7e3072661dfa73c9d37f320c38b373  klient.zip' | shasum -a 256 -c -
+          /usr/bin/ditto -x -k klient.zip 'Pobrane pliki'
+          cd 'Pobrane pliki/IamFree-Klient-macOS'
+          test -x 'Instaluj IamFree.command'
+          test -x START.command
+          "runtime/$RUNTIME/node" -e 'if (require("./aplikacja/wydanie.json").version !== "1.2.0") process.exit(1)'
+
+      - name: Instalacja i sprawdzenie aplikacji w folderze użytkownika
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$HOME/Applications/IamFree Monitoring.app"
+          test ! -e "$app"
+          if lsof -nP -iTCP:8767 -sTCP:LISTEN -t >/dev/null; then
+            echo 'Port 8767 jest zajęty przed rozpoczęciem testu.'
+            exit 1
+          fi
+          cd "$RUNNER_TEMP/Pobrane pliki/IamFree-Klient-macOS"
+          './Instaluj IamFree.command'
+          test -x "$app/Contents/Resources/Otworz.command"
+          /usr/bin/codesign --verify --strict --verbose=2 "$app"
+          plist="$app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = pl.iamfree.monitoring
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' "$plist")" = iamfree-monitoring
+          test "$(readlink "$HOME/Desktop/IamFree Monitoring")" = "$app"
+
+      - name: Otwarcie panelu po instalacji, z ikony i z adresu portalu
+        shell: bash
+        run: |
+          set -euo pipefail
+          origin='http://127.0.0.1:8767'
+          resources="$HOME/Applications/IamFree Monitoring.app/Contents/Resources"
+          check_login() {
+            for ((i=0; i<60; i++)); do
+              if curl -fsS --max-time 2 "$origin/logowanie" -o "$RUNNER_TEMP/logowanie.html" 2>/dev/null &&
+                 grep -Fq 'autocomplete="current-password"' "$RUNNER_TEMP/logowanie.html"; then
+                test "$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "$origin/api/telemetry")" = 401
+                return
+              fi
+              sleep 1
+            done
+            echo "Panel logowania nie odpowiedział po 60 próbach." >&2
+            return 1
+          }
+          stop_test_instance() {
+            local pid
+            pid="$(lsof -nP -iTCP:8767 -sTCP:LISTEN -t)"
+            lsof -a -p "$pid" -d cwd -Fn | grep -Fx "n$resources"
+            kill -TERM "$pid"
+            for ((i=0; i<15; i++)); do
+              if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+          check_login
+          stop_test_instance
+          /usr/bin/open "$HOME/Desktop/IamFree Monitoring"
+          check_login
+          stop_test_instance
+          /usr/bin/open 'iamfree-monitoring://open'
+          check_login
