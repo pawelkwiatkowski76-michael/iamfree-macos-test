@@ -1,6 +1,14 @@
 name: Test instalacji IamFree 1.2.0
 on:
   workflow_dispatch:
+    inputs:
+      apple_runner:
+        description: Wersja macOS dla Apple Silicon
+        type: choice
+        default: macos-15
+        options:
+          - macos-15
+          - macos-26
 
 permissions: {}
 
@@ -13,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          - runner: ${{ inputs.apple_runner }}
             cpu: arm64
             runtime: arm64
           - runner: macos-15-intel
