@@ -1,11 +1,11 @@
-name: Test instalacji IamFree 1.2.1
+name: Test instalacji IamFree 1.2.2
 on:
   workflow_dispatch:
     inputs:
       apple_runner:
         description: Wersja macOS dla Apple Silicon
         type: choice
-        default: macos-15
+        default: xcode-27
         options:
           - macos-15
           - macos-26
@@ -41,12 +41,12 @@ jobs:
           test "$(uname -m)" = "$EXPECTED_CPU"
           curl --fail --silent --show-error --proto '=https' --retry 2 --max-time 120 \
             -o klient.zip https://iamfree.pl/monitoring/pobierz/IamFree-Klient-macOS.zip
-          echo '81d7edfbffa5d4ec69aab7f7a56e24cafced9f565133ec326093d3a9101efcf1  klient.zip' | shasum -a 256 -c -
+          echo '4d6a60cb555c5409d1945475245083120d22240966a432f0eb2652e2a5140ccc  klient.zip' | shasum -a 256 -c -
           /usr/bin/ditto -x -k klient.zip 'Pobrane pliki'
           cd 'Pobrane pliki/IamFree-Klient-macOS'
           test -x 'Instaluj IamFree.command'
-          test -x START.command
-          "runtime/$RUNTIME/node" -e 'if (require("./aplikacja/wydanie.json").version !== "1.2.1") process.exit(1)'
+          test -x "runtime/$RUNTIME/IamFree"
+          "runtime/$RUNTIME/node" -e 'if (require("./aplikacja/wydanie.json").version !== "1.2.2") process.exit(1)'
 
       - name: Instalacja i sprawdzenie aplikacji w folderze użytkownika
         shell: bash
@@ -59,11 +59,18 @@ jobs:
             exit 1
           fi
           cd "$RUNNER_TEMP/Pobrane pliki/IamFree-Klient-macOS"
+          if pgrep -x Terminal >/dev/null; then
+            echo 'Terminal jest już otwarty przed testem. Potrzebny jest czysty runner.'
+            exit 1
+          fi
           './Instaluj IamFree.command'
-          test -x "$app/Contents/Resources/Otworz.command"
+          test -x "$app/Contents/Helpers/IamFree"
+          test -x "$app/Contents/Helpers/node"
+          test ! -e "$app/Contents/Resources/Otworz.command"
           /usr/bin/codesign --verify --strict --verbose=2 "$app"
           plist="$app/Contents/Info.plist"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = pl.iamfree.monitoring
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = 1.2.2
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' "$plist")" = iamfree-monitoring
           test "$(readlink "$HOME/Desktop/IamFree Monitoring")" = "$app"
 
@@ -71,23 +78,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          origin='http://127.0.0.1:8767'
+          port=8767
           resources="$HOME/Applications/IamFree Monitoring.app/Contents/Resources"
+          # Observe the disposable runner while Launch Services opens the shortcut.
+          (while :; do
+            if pgrep -x Terminal >/dev/null; then touch "$RUNNER_TEMP/terminal-launched"; fi
+            sleep 0.25
+          done) &
+          watcher=$!
+          trap 'kill "$watcher" 2>/dev/null || true; launchctl unsetenv IAMFREE_PORT' EXIT
+          browser_connected() {
+            local pid browser
+            for pid in $(lsof -nP -iTCP:"$port" -sTCP:ESTABLISHED -Fpn 2>/dev/null |
+              awk -v dest="->127.0.0.1:$port" '/^p/{p=substr($0,2)} /^n/ && index($0,dest){print p}' | sort -u); do
+              browser=$(ps -p "$pid" -o comm=) || continue
+              case "$browser" in
+                *Safari*|*WebKit.Networking*|*Chrome*|*Chromium*|*Firefox*|*firefox*|*Microsoft\ Edge*)
+                  echo "Przeglądarka połączona z portem $port: $browser"
+                  return 0 ;;
+              esac
+            done
+            return 1
+          }
           check_login() {
+            local origin="http://127.0.0.1:$port"
             for ((i=0; i<60; i++)); do
               if curl -fsS --max-time 2 "$origin/logowanie" -o "$RUNNER_TEMP/logowanie.html" 2>/dev/null &&
-                 grep -Fq 'autocomplete="current-password"' "$RUNNER_TEMP/logowanie.html"; then
+                 grep -Fq 'autocomplete="current-password"' "$RUNNER_TEMP/logowanie.html" && browser_connected; then
                 test "$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "$origin/api/telemetry")" = 401
+                if [ -e "$RUNNER_TEMP/terminal-launched" ] || pgrep -x Terminal >/dev/null; then
+                  echo 'Otwarcie panelu uruchomiło Terminal.' >&2
+                  return 1
+                fi
                 return
               fi
               sleep 1
             done
-            echo "Panel logowania nie odpowiedział po 60 próbach." >&2
+            echo "Nie potwierdzono formularza i połączenia przeglądarki na porcie $port." >&2
+            lsof -nP -iTCP:"$port" || true
             return 1
           }
           stop_test_instance() {
             local pid
-            pid="$(lsof -nP -iTCP:8767 -sTCP:LISTEN -t)"
+            pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t)"
             lsof -a -p "$pid" -d cwd -Fn | grep -Fx "n$resources"
             kill -TERM "$pid"
             for ((i=0; i<15; i++)); do
@@ -98,8 +131,13 @@ jobs:
           }
           check_login
           stop_test_instance
+          # A tab from an earlier launch can reconnect only to its old port.
+          port=8768
+          launchctl setenv IAMFREE_PORT "$port"
           /usr/bin/open "$HOME/Desktop/IamFree Monitoring"
           check_login
           stop_test_instance
+          port=8769
+          launchctl setenv IAMFREE_PORT "$port"
           /usr/bin/open 'iamfree-monitoring://open'
           check_login
