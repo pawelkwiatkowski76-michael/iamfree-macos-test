@@ -9,6 +9,7 @@ on:
         options:
           - macos-15
           - macos-26
+          - xcode-27
 
 permissions: {}
 
